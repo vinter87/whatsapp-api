@@ -13,6 +13,13 @@ jobs:
               with:
                   node-version: 16
                   registry-url: https://registry.npmjs.org
+
+            - name: Install Dependencies
+              run: yarn
+
+            - name: Build
+              run: yarn run build:tsc
+
             - name: publish
               run: npm publish --access public
               env:
