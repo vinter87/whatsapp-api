@@ -1,9 +1,13 @@
-name: "publish npm"
+name: "publish"
 
-on: push
+on: 
+    push:
+        branches:
+            - master
 
 jobs:
-    publish:
+    release:
+        name : publish
         runs-on: ubuntu-latest
         steps:
             - name: checkout
@@ -13,14 +17,7 @@ jobs:
               with:
                   node-version: 16
                   registry-url: https://registry.npmjs.org
-
-            - name: Install Dependencies
-              run: yarn
-
-            - name: Build
-              run: yarn run build:tsc
-
-            - name: publish
+            - name: publish      
               run: npm publish --access public
               env:
                   NODE_AUTH_TOKEN: ${{secrets.NPM_AUTH_TOKEN}}
