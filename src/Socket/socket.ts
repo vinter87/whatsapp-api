@@ -89,14 +89,8 @@ export const makeSocket = ({
 			connectTimeoutMs,
 			async (resolve, reject) => {
 				try {
-					// Explicitly specify the correct overload for send method
-					ws.send(bytes, (err?: Error) => {
-						if (err) {
-							reject(err);
-						} else {
-							resolve();
-						}
-					});
+					await (ws.send as (data: ArrayBufferLike | Blob | string | ArrayBufferView) => Promise<void>)(bytes);
+					resolve();
 				} catch (error) {
 					reject(error);
 				}
