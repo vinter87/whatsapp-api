@@ -31,12 +31,12 @@ export interface WAGroupCreateResponse {
     status: number;
     gid?: string;
     participants?: [{
-        [key: string]: {};
+        [key: string]: any;
     }];
 }
 export interface GroupModificationResponse {
     status: number;
     participants?: {
-        [key: string]: {};
+        [key: string]: any;
     };
 }

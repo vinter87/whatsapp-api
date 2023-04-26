@@ -8,7 +8,7 @@ export declare const makeBusinessSocket: (config: SocketConfig) => {
         products: import("../Types").Product[];
         nextPageCursor: string | undefined;
     }>;
-    getCollections: (jid?: string | undefined, limit?: number) => Promise<{
+    getCollections: (jid?: string, limit?: number) => Promise<{
         collections: import("../Types").CatalogCollection[];
     }>;
     productCreate: (create: ProductCreate) => Promise<import("../Types").Product>;
@@ -88,17 +88,16 @@ export declare const makeBusinessSocket: (config: SocketConfig) => {
         creds: import("../Types").AuthenticationCreds;
         keys: import("../Types").SignalKeyStoreWithTransaction;
     };
-    signalRepository: import("../Types").SignalRepository;
     user: import("../Types").Contact | undefined;
     generateMessageTag: () => string;
     query: (node: BinaryNode, timeoutMs?: number | undefined) => Promise<BinaryNode>;
-    waitForMessage: <T_2>(msgId: string, timeoutMs?: number | undefined) => Promise<T_2>;
+    waitForMessage: (msgId: string, timeoutMs?: number | undefined) => Promise<any>;
     waitForSocketOpen: () => Promise<void>;
-    sendRawMessage: (data: Uint8Array | Buffer) => Promise<void>;
+    sendRawMessage: (data: Buffer | Uint8Array) => Promise<void>;
     sendNode: (frame: BinaryNode) => Promise<void>;
     logout: (msg?: string | undefined) => Promise<void>;
     end: (error: Error | undefined) => void;
-    onUnexpectedError: (err: Error | import("@hapi/boom").Boom<any>, msg: string) => void;
+    onUnexpectedError: (error: Error, msg: string) => void;
     uploadPreKeys: (count?: number) => Promise<void>;
     uploadPreKeysToServerIfRequired: () => Promise<void>;
     waitForConnectionUpdate: (check: (u: Partial<import("../Types").ConnectionState>) => boolean | undefined, timeoutMs?: number | undefined) => Promise<void>;

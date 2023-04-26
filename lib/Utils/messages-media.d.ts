@@ -1,4 +1,6 @@
 /// <reference types="node" />
+/// <reference types="node" />
+/// <reference types="node" />
 import { Boom } from '@hapi/boom';
 import { AxiosRequestConfig } from 'axios';
 import type { Logger } from 'pino';
@@ -26,7 +28,7 @@ export declare const mediaMessageSHA256B64: (message: WAMessageContent) => strin
 export declare function getAudioDuration(buffer: Buffer | string | Readable): Promise<number | undefined>;
 export declare const toReadable: (buffer: Buffer) => Readable;
 export declare const toBuffer: (stream: Readable) => Promise<Buffer>;
-export declare const getStream: (item: WAMediaUpload, opts?: AxiosRequestConfig<any> | undefined) => Promise<{
+export declare const getStream: (item: WAMediaUpload, opts?: AxiosRequestConfig) => Promise<{
     readonly stream: Readable;
     readonly type: "buffer";
 } | {

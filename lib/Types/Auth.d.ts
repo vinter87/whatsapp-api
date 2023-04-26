@@ -10,7 +10,6 @@ export declare type SignedKeyPair = {
     keyPair: KeyPair;
     signature: Uint8Array;
     keyId: number;
-    timestampS?: number;
 };
 export declare type ProtocolAddress = {
     name: string;
@@ -58,8 +57,8 @@ export declare type AuthenticationCreds = SignalCreds & {
 };
 export declare type SignalDataTypeMap = {
     'pre-key': KeyPair;
-    'session': Uint8Array;
-    'sender-key': Uint8Array;
+    'session': any;
+    'sender-key': any;
     'sender-key-memory': {
         [jid: string]: boolean;
     };
