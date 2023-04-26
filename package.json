@@ -27,7 +27,7 @@
     "lint": "eslint . --ext .js,.ts,.jsx,.tsx",
     "lint:fix": "eslint . --fix --ext .js,.ts,.jsx,.tsx"
   },
-  "author": "Adhiraj Singh",
+  "author": "Vinter87",
   "license": "MIT",
   "repository": {
     "url": "git@github.com:vinter87/whatsapp-api.git"
