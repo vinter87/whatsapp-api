@@ -58,46 +58,46 @@ export const makeSocket = ({
 	const uqTagId = generateMdTagPrefix()
 	const generateMessageTag = () => `${uqTagId}${epoch++}`
 
-// 	const sendPromise = promisify<void>(ws.send)
+ 	const sendPromise = promisify<void>(ws.send)
 	/** send a raw buffer */
-	const sendRawMessage = async(data: Uint8Array | Buffer) => {
-		if(ws.readyState !== ws.OPEN) {
-			throw new Boom('Connection Closed', { statusCode: DisconnectReason.connectionClosed })
-		}
-
-		const bytes = noise.encodeFrame(data)
-		await promiseTimeout<void>(
-			connectTimeoutMs,
-			async(resolve, reject) => {
-				try {
-// 					await sendPromise.call(ws, bytes)
-					await (ws.send as (data: ArrayBufferLike | Blob | string | ArrayBufferView) => Promise<void>)(bytes);
-					resolve()
-				} catch(error) {
-					reject(error)
-				}
-			}
-		)
-	}
-	
-// 	const sendRawMessage = async (data: Uint8Array | Buffer) => {
-// 		if (ws.readyState !== ws.OPEN) {
+// 	const sendRawMessage = async(data: Uint8Array | Buffer) => {
+// 		if(ws.readyState !== ws.OPEN) {
 // 			throw new Boom('Connection Closed', { statusCode: DisconnectReason.connectionClosed })
 // 		}
 
 // 		const bytes = noise.encodeFrame(data)
 // 		await promiseTimeout<void>(
 // 			connectTimeoutMs,
-// 			async (resolve, reject) => {
+// 			async(resolve, reject) => {
 // 				try {
+// // 					await sendPromise.call(ws, bytes)
 // 					await (ws.send as (data: ArrayBufferLike | Blob | string | ArrayBufferView) => Promise<void>)(bytes);
-// 					resolve();
-// 				} catch (error) {
-// 					reject(error);
+// 					resolve()
+// 				} catch(error) {
+// 					reject(error)
 // 				}
 // 			}
-// 		);
-// 	};
+// 		)
+// 	}
+	
+	const sendRawMessage = async (data: Uint8Array | Buffer) => {
+		if (ws.readyState !== ws.OPEN) {
+			throw new Boom('Connection Closed', { statusCode: DisconnectReason.connectionClosed })
+		}
+
+		const bytes = noise.encodeFrame(data)
+		await promiseTimeout<void>(
+			connectTimeoutMs,
+			async (resolve, reject) => {
+				try {
+					await (ws.send as (data: ArrayBufferLike | Blob | string | ArrayBufferView) => Promise<void>)(bytes);
+					resolve();
+				} catch (error) {
+					reject(error);
+				}
+			}
+		);
+	};
 
 
 	/** send a binary node */
