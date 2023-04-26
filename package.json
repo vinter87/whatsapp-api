@@ -1,6 +1,6 @@
 {
   "name": "@vinter87/whatsapp-api",
-  "version": "5.0.0",
+  "version": "1.0.3",
   "description": "WhatsApp API",
   "homepage": "https://github.com/vinter87/whatsapp-api",
   "main": "lib/index.js",
@@ -67,11 +67,6 @@
       "optional": true
     }
   },
-  "files": [
-    "lib/*",
-    "WAProto/*",
-    "WASignalGroup/*.js"
-  ],
   "devDependencies": {
     "@adiwajshing/eslint-config": "git+https://github.com/adiwajshing/eslint-config",
     "@adiwajshing/keyed-db": "^0.2.4",
