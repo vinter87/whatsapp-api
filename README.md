@@ -20,18 +20,20 @@ The script covers most common use cases.
 To run the example script, download or clone the repo and then type the following in a terminal:
 1. ``` cd path/to/Baileys ```
 2. ``` yarn ```
-3. ``` yarn example ```
+4. yarn install typescript 
+5. yarn install ts-node
+6. yarn run example
 
 ## Install
 
 Use the stable version:
 ```
-yarn add @adiwajshing/baileys
+yarn add @vinter87/whatsapp-api
 ```
 
 Use the edge version (no guarantee of stability, but latest fixes + features)
 ```
-yarn add github:adiwajshing/baileys
+yarn add github:vinter87/whatsapp-api
 ```
 
 Then import your code using:
