@@ -1,6 +1,6 @@
 {
-  "name": "@adiwajshing/baileys",
-  "version": "5.0.0",
+  "name": "@vinter87/baileys",
+  "version": "1.0.0",
   "description": "WhatsApp API",
   "homepage": "https://github.com/vinter87/whatsapp-api",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "lint": "eslint . --ext .js,.ts,.jsx,.tsx",
     "lint:fix": "eslint . --fix --ext .js,.ts,.jsx,.tsx"
   },
-  "author": "Adhiraj Singh",
+  "author": "Vinter87",
   "license": "MIT",
   "repository": {
     "url": "git@github.com:vinter87/whatsapp-api.git"
