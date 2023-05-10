@@ -89,20 +89,20 @@ const startSock = async() => {
 			}
 
 			if(events.call) {
-				console.log('recv call event', events.call)
+				//console.log('recv call event', events.call)
 			}
 
 			// history received
 			if(events['messaging-history.set']) {
 				const { chats, contacts, messages, isLatest } = events['messaging-history.set']
-				console.log(`recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest})`)
+				//console.log(`recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest})`)
 			}
 
 			// received a new message
 			if(events['messages.upsert']) {
 				const upsert = events['messages.upsert']
 				console.log('recv messages ', JSON.stringify(upsert, undefined, 2))
-
+				/*
 				if(upsert.type === 'notify') {
 					for(const msg of upsert.messages) {
 						if(!msg.key.fromMe && doReplies) {
@@ -112,6 +112,7 @@ const startSock = async() => {
 						}
 					}
 				}
+				*/
 			}
 
 			// messages updated like status delivered, message deleted etc.
