@@ -1,6 +1,6 @@
 {
   "name": "@vinter87/whatsapp-api",
-  "version": "1.0.11",
+  "version": "1.0.15",
   "description": "WhatsApp API",
   "homepage": "https://github.com/vinter87/whatsapp-api",
   "main": "lib/index.js",
