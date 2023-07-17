@@ -2,7 +2,6 @@
   "name": "@vinter87/whatsapp-api",
   "version": "1.0.15",
   "description": "WhatsApp API",
-  "homepage": "https://github.com/vinter87/whatsapp-api",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "keywords": [
@@ -29,9 +28,6 @@
   },
   "author": "vinter",
   "license": "MIT",
-  "repository": {
-    "url": "git@github.com:vinter87/whatsapp-api.git"
-  },
   "dependencies": {
     "@hapi/boom": "^9.1.3",
     "axios": "^1.3.3",
