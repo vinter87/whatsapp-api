@@ -1,908 +1,789 @@
 import { Boom } from '@hapi/boom'
-import axios from 'axios'
-import { randomBytes } from 'crypto'
-import { promises as fs } from 'fs'
-import { Logger } from 'pino'
+import { AxiosRequestConfig } from 'axios'
+import { exec } from 'child_process'
+import * as Crypto from 'crypto'
+import { once } from 'events'
+import { createReadStream, createWriteStream, promises as fs, WriteStream } from 'fs'
+import type { IAudioMetadata } from 'music-metadata'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import type { Logger } from 'pino'
+import { Readable, Transform } from 'stream'
+import { URL } from 'url'
 import { proto } from '../../WAProto'
-import { MEDIA_KEYS, URL_EXCLUDE_REGEX, URL_REGEX, WA_DEFAULT_EPHEMERAL } from '../Defaults'
-import {
-	AnyMediaMessageContent,
-	AnyMessageContent,
-	DownloadableMessage,
-	MediaGenerationOptions,
-	MediaType,
-	MessageContentGenerationOptions,
-	MessageGenerationOptions,
-	MessageGenerationOptionsFromContent,
-	MessageType,
-	MessageUserReceipt,
-	WAMediaUpload,
-	WAMessage,
-	WAMessageContent,
-	WAMessageStatus,
-	WAProto,
-	WATextMessage,
-} from '../Types'
-import { isJidGroup, jidNormalizedUser } from '../WABinary'
-import { sha256 } from './crypto'
-import { generateMessageID, getKeyAuthor, unixTimestampSeconds } from './generics'
-import { downloadContentFromMessage, encryptedStream, generateThumbnail, getAudioDuration, getAudioWaveform, MediaDownloadOptions } from './messages-media'
+import { DEFAULT_ORIGIN, MEDIA_HKDF_KEY_MAPPING, MEDIA_PATH_MAP } from '../Defaults'
+import { BaileysEventMap, DownloadableMessage, MediaConnInfo, MediaDecryptionKeyInfo, MediaType, MessageType, SocketConfig, WAGenericMediaMessage, WAMediaUpload, WAMediaUploadFunction, WAMessageContent } from '../Types'
+import { BinaryNode, getBinaryNodeChild, getBinaryNodeChildBuffer, jidNormalizedUser } from '../WABinary'
+import { aesDecryptGCM, aesEncryptGCM, hkdf } from './crypto'
+import { generateMessageID } from './generics'
 
-type MediaUploadData = {
-	media: WAMediaUpload
-	caption?: string
-	ptt?: boolean
-	seconds?: number
-	gifPlayback?: boolean
-	fileName?: string
-	jpegThumbnail?: string
-	mimetype?: string
-	width?: number
-	height?: number
-	waveform?: Uint8Array
+const getTmpFilesDirectory = () => tmpdir()
+
+const getImageProcessingLibrary = async() => {
+	const [_jimp, sharp] = await Promise.all([
+		(async() => {
+			const jimp = await (
+				import('jimp')
+					.catch(() => { })
+			)
+			return jimp
+		})(),
+		(async() => {
+			const sharp = await (
+				import('sharp')
+					.catch(() => { })
+			)
+			return sharp
+		})()
+	])
+
+	if(sharp) {
+		return { sharp }
+	}
+
+	const jimp = _jimp?.default || _jimp
+	if(jimp) {
+		return { jimp }
+	}
+
+	throw new Boom('No image processing library available')
 }
 
-const MIMETYPE_MAP: { [T in MediaType]?: string } = {
-	image: 'image/jpeg',
-	video: 'video/mp4',
-	document: 'application/pdf',
-	audio: 'audio/ogg; codecs=opus',
-	sticker: 'image/webp',
-	'product-catalog-image': 'image/jpeg',
+export const hkdfInfoKey = (type: MediaType) => {
+	const hkdfInfo = MEDIA_HKDF_KEY_MAPPING[type]
+	return `WhatsApp ${hkdfInfo} Keys`
 }
 
-const MessageTypeProto = {
-	'image': WAProto.Message.ImageMessage,
-	'video': WAProto.Message.VideoMessage,
-	'audio': WAProto.Message.AudioMessage,
-	'sticker': WAProto.Message.StickerMessage,
-   	'document': WAProto.Message.DocumentMessage,
-} as const
+/** generates all the keys required to encrypt/decrypt & sign a media message */
+export function getMediaKeys(buffer: Uint8Array | string | null | undefined, mediaType: MediaType): MediaDecryptionKeyInfo {
+	if(!buffer) {
+		throw new Boom('Cannot derive from empty media key')
+	}
 
-const ButtonType = proto.Message.ButtonsMessage.HeaderType
+	if(typeof buffer === 'string') {
+		buffer = Buffer.from(buffer.replace('data:;base64,', ''), 'base64')
+	}
 
-/**
- * Uses a regex to test whether the string contains a URL, and returns the URL if it does.
- * @param text eg. hello https://google.com
- * @returns the URL, eg. https://google.com
- */
-export const extractUrlFromText = (text: string) => (
-	!URL_EXCLUDE_REGEX.test(text) ? text.match(URL_REGEX)?.[0] : undefined
+	// expand using HKDF to 112 bytes, also pass in the relevant app info
+	const expandedMediaKey = hkdf(buffer, 112, { info: hkdfInfoKey(mediaType) })
+	return {
+		iv: expandedMediaKey.slice(0, 16),
+		cipherKey: expandedMediaKey.slice(16, 48),
+		macKey: expandedMediaKey.slice(48, 80),
+	}
+}
+
+/** Extracts video thumb using FFMPEG */
+const extractVideoThumb = async(
+	path: string,
+	destPath: string,
+	time: string,
+	size: { width: number, height: number },
+) => new Promise((resolve, reject) => {
+    	const cmd = `ffmpeg -ss ${time} -i ${path} -y -vf scale=${size.width}:-1 -vframes 1 -f image2 ${destPath}`
+    	exec(cmd, (err) => {
+    		if(err) {
+			reject(err)
+		} else {
+			resolve()
+		}
+    	})
+}) as Promise<void>
+
+export const extractImageThumb = async(bufferOrFilePath: Readable | Buffer | string, width = 32) => {
+	if(bufferOrFilePath instanceof Readable) {
+		bufferOrFilePath = await toBuffer(bufferOrFilePath)
+	}
+
+	const lib = await getImageProcessingLibrary()
+	if('sharp' in lib && typeof lib.sharp?.default === 'function') {
+		const img = lib.sharp!.default(bufferOrFilePath)
+		const dimensions = await img.metadata()
+
+		const buffer = await img
+			.resize(width)
+			.jpeg({ quality: 50 })
+			.toBuffer()
+		return {
+			buffer,
+			original: {
+				width: dimensions.width,
+				height: dimensions.height,
+			},
+		}
+	} else if('jimp' in lib && typeof lib.jimp?.read === 'function') {
+		const { read, MIME_JPEG, RESIZE_BILINEAR, AUTO } = lib.jimp
+
+		const jimp = await read(bufferOrFilePath as any)
+		const dimensions = {
+			width: jimp.getWidth(),
+			height: jimp.getHeight()
+		}
+		const buffer = await jimp
+			.quality(50)
+			.resize(width, AUTO, RESIZE_BILINEAR)
+			.getBufferAsync(MIME_JPEG)
+		return {
+			buffer,
+			original: dimensions
+		}
+	} else {
+		throw new Boom('No image processing library available')
+	}
+}
+
+export const encodeBase64EncodedStringForUpload = (b64: string) => (
+	encodeURIComponent(
+		b64
+			.replace(/\+/g, '-')
+			.replace(/\//g, '_')
+			.replace(/\=+$/, '')
+	)
 )
 
-export const generateLinkPreviewIfRequired = async(text: string, getUrlInfo: MessageGenerationOptions['getUrlInfo'], logger: MessageGenerationOptions['logger']) => {
-	const url = extractUrlFromText(text)
-	if(!!getUrlInfo && url) {
+export const generateProfilePicture = async(mediaUpload: WAMediaUpload) => {
+	let bufferOrFilePath: Buffer | string
+	if(Buffer.isBuffer(mediaUpload)) {
+		bufferOrFilePath = mediaUpload
+	} else if('url' in mediaUpload) {
+		bufferOrFilePath = mediaUpload.url.toString()
+	} else {
+		bufferOrFilePath = await toBuffer(mediaUpload.stream)
+	}
+
+	const lib = await getImageProcessingLibrary()
+	let img: Promise<Buffer>
+	if('sharp' in lib && typeof lib.sharp?.default === 'function') {
+		img = lib.sharp!.default(bufferOrFilePath)
+			.resize(640, 640)
+			.jpeg({
+				quality: 50,
+			})
+			.toBuffer()
+	} else if('jimp' in lib && typeof lib.jimp?.read === 'function') {
+		const { read, MIME_JPEG, RESIZE_BILINEAR } = lib.jimp
+		const jimp = await read(bufferOrFilePath as any)
+		const min = Math.min(jimp.getWidth(), jimp.getHeight())
+		const cropped = jimp.crop(0, 0, min, min)
+
+		img = cropped
+			.quality(50)
+			.resize(640, 640, RESIZE_BILINEAR)
+			.getBufferAsync(MIME_JPEG)
+	} else {
+		throw new Boom('No image processing library available')
+	}
+
+	return {
+		img: await img,
+	}
+}
+
+/** gets the SHA256 of the given media message */
+export const mediaMessageSHA256B64 = (message: WAMessageContent) => {
+	const media = Object.values(message)[0] as WAGenericMediaMessage
+	return media?.fileSha256 && Buffer.from(media.fileSha256).toString ('base64')
+}
+
+export async function getAudioDuration(buffer: Buffer | string | Readable) {
+	const musicMetadata = await import('music-metadata')
+	let metadata: IAudioMetadata
+	if(Buffer.isBuffer(buffer)) {
+		metadata = await musicMetadata.parseBuffer(buffer, undefined, { duration: true })
+	} else if(typeof buffer === 'string') {
+		const rStream = createReadStream(buffer)
 		try {
-			const urlInfo = await getUrlInfo(url)
-			return urlInfo
-		} catch(error) { // ignore if fails
-			logger?.warn({ trace: error.stack }, 'url generation failed')
-		}
-	}
-}
-
-export const prepareWAMessageMedia = async(
-	message: AnyMediaMessageContent,
-	options: MediaGenerationOptions
-) => {
-	const logger = options.logger
-
-	let mediaType: typeof MEDIA_KEYS[number] | undefined
-	for(const key of MEDIA_KEYS) {
-		if(key in message) {
-			mediaType = key
-		}
-	}
-
-	if(!mediaType) {
-		throw new Boom('Invalid media type', { statusCode: 400 })
-	}
-
-	const uploadData: MediaUploadData = {
-		...message,
-		media: message[mediaType]
-	}
-	delete uploadData[mediaType]
-	// check if cacheable + generate cache key
-	const cacheableKey = typeof uploadData.media === 'object' &&
-			('url' in uploadData.media) &&
-			!!uploadData.media.url &&
-			!!options.mediaCache && (
-	// generate the key
-		mediaType + ':' + uploadData.media.url!.toString()
-	)
-
-	if(mediaType === 'document' && !uploadData.fileName) {
-		uploadData.fileName = 'file'
-	}
-
-	if(!uploadData.mimetype) {
-		uploadData.mimetype = MIMETYPE_MAP[mediaType]
-	}
-
-	// check for cache hit
-	if(cacheableKey) {
-		const mediaBuff = options.mediaCache!.get<Buffer>(cacheableKey)
-		if(mediaBuff) {
-			logger?.debug({ cacheableKey }, 'got media cache hit')
-
-			const obj = WAProto.Message.decode(mediaBuff)
-			const key = `${mediaType}Message`
-
-			Object.assign(obj[key], { ...uploadData, media: undefined })
-
-			return obj
-		}
-	}
-
-	const requiresDurationComputation = mediaType === 'audio' && typeof uploadData.seconds === 'undefined'
-	const requiresThumbnailComputation = (mediaType === 'image' || mediaType === 'video') &&
-										(typeof uploadData['jpegThumbnail'] === 'undefined')
-	const requiresWaveformProcessing = mediaType === 'audio' && uploadData?.ptt === true
-	const requiresOriginalForSomeProcessing = requiresDurationComputation || requiresThumbnailComputation
-	const {
-		mediaKey,
-		encWriteStream,
-		bodyPath,
-		fileEncSha256,
-		fileSha256,
-		fileLength,
-		didSaveToTmpPath
-	} = await encryptedStream(
-		uploadData.media,
-		options.mediaTypeOverride || mediaType,
-		{
-			logger,
-			saveOriginalFileIfRequired: requiresOriginalForSomeProcessing,
-			opts: options.options
-		}
-	)
-	 // url safe Base64 encode the SHA256 hash of the body
-	const fileEncSha256B64 = fileEncSha256.toString('base64')
-	const [{ mediaUrl, directPath }] = await Promise.all([
-		(async() => {
-			const result = await options.upload(
-				encWriteStream,
-				{ fileEncSha256B64, mediaType, timeoutMs: options.mediaUploadTimeoutMs }
-			)
-			logger?.debug({ mediaType, cacheableKey }, 'uploaded media')
-			return result
-		})(),
-		(async() => {
-			try {
-				if(requiresThumbnailComputation) {
-					const {
-						thumbnail,
-						originalImageDimensions
-					} = await generateThumbnail(bodyPath!, mediaType as 'image' | 'video', options)
-					uploadData.jpegThumbnail = thumbnail
-					if(!uploadData.width && originalImageDimensions) {
-						uploadData.width = originalImageDimensions.width
-						uploadData.height = originalImageDimensions.height
-						logger?.debug('set dimensions')
-					}
-
-					logger?.debug('generated thumbnail')
-				}
-
-				if(requiresDurationComputation) {
-					uploadData.seconds = await getAudioDuration(bodyPath!)
-					logger?.debug('computed audio duration')
-				}
-
-				if(requiresWaveformProcessing) {
-					uploadData.waveform = await getAudioWaveform(bodyPath!, logger)
-					logger?.debug('processed waveform')
-				}
-			} catch(error) {
-				logger?.warn({ trace: error.stack }, 'failed to obtain extra info')
-			}
-		})(),
-	])
-		.finally(
-			async() => {
-				encWriteStream.destroy()
-				// remove tmp files
-				if(didSaveToTmpPath && bodyPath) {
-					await fs.unlink(bodyPath)
-					logger?.debug('removed tmp files')
-				}
-			}
-		)
-
-	const obj = WAProto.Message.fromObject({
-		[`${mediaType}Message`]: MessageTypeProto[mediaType].fromObject(
-			{
-				url: mediaUrl,
-				directPath,
-				mediaKey,
-				fileEncSha256,
-				fileSha256,
-				fileLength,
-				mediaKeyTimestamp: unixTimestampSeconds(),
-				...uploadData,
-				media: undefined
-			}
-		)
-	})
-
-	if(cacheableKey) {
-		logger?.debug({ cacheableKey }, 'set cache')
-		options.mediaCache!.set(cacheableKey, WAProto.Message.encode(obj).finish())
-	}
-
-	return obj
-}
-
-export const prepareDisappearingMessageSettingContent = (ephemeralExpiration?: number) => {
-	ephemeralExpiration = ephemeralExpiration || 0
-	const content: WAMessageContent = {
-		ephemeralMessage: {
-			message: {
-				protocolMessage: {
-					type: WAProto.Message.ProtocolMessage.Type.EPHEMERAL_SETTING,
-					ephemeralExpiration
-				}
-			}
-		}
-	}
-	return WAProto.Message.fromObject(content)
-}
-
-/**
- * Generate forwarded message content like WA does
- * @param message the message to forward
- * @param options.forceForward will show the message as forwarded even if it is from you
- */
-export const generateForwardMessageContent = (
-	message: WAMessage,
-	forceForward?: boolean
-) => {
-	let content = message.message
-	if(!content) {
-		throw new Boom('no content in message', { statusCode: 400 })
-	}
-
-	// hacky copy
-	content = normalizeMessageContent(content)
-	content = proto.Message.decode(proto.Message.encode(content!).finish())
-
-	let key = Object.keys(content)[0] as MessageType
-
-	let score = content[key].contextInfo?.forwardingScore || 0
-	score += message.key.fromMe && !forceForward ? 0 : 1
-	if(key === 'conversation') {
-		content.extendedTextMessage = { text: content[key] }
-		delete content.conversation
-
-		key = 'extendedTextMessage'
-	}
-
-	if(score > 0) {
-		content[key].contextInfo = { forwardingScore: score, isForwarded: true }
-	} else {
-		content[key].contextInfo = {}
-	}
-
-	return content
-}
-
-export const generateWAMessageContent = async(
-	message: AnyMessageContent,
-	options: MessageContentGenerationOptions
-) => {
-	let m: WAMessageContent = {}
-	if('text' in message) {
-		const extContent = { text: message.text } as WATextMessage
-
-		let urlInfo = message.linkPreview
-		if(typeof urlInfo === 'undefined') {
-			urlInfo = await generateLinkPreviewIfRequired(message.text, options.getUrlInfo, options.logger)
-		}
-
-		if(urlInfo) {
-			extContent.canonicalUrl = urlInfo['canonical-url']
-			extContent.matchedText = urlInfo['matched-text']
-			extContent.jpegThumbnail = urlInfo.jpegThumbnail
-			extContent.description = urlInfo.description
-			extContent.title = urlInfo.title
-			extContent.previewType = 0
-
-			const img = urlInfo.highQualityThumbnail
-			if(img) {
-				extContent.thumbnailDirectPath = img.directPath
-				extContent.mediaKey = img.mediaKey
-				extContent.mediaKeyTimestamp = img.mediaKeyTimestamp
-				extContent.thumbnailWidth = img.width
-				extContent.thumbnailHeight = img.height
-				extContent.thumbnailSha256 = img.fileSha256
-				extContent.thumbnailEncSha256 = img.fileEncSha256
-			}
-		}
-
-		m.extendedTextMessage = extContent
-	} else if('contacts' in message) {
-		const contactLen = message.contacts.contacts.length
-		if(!contactLen) {
-			throw new Boom('require atleast 1 contact', { statusCode: 400 })
-		}
-
-		if(contactLen === 1) {
-			m.contactMessage = WAProto.Message.ContactMessage.fromObject(message.contacts.contacts[0])
-		} else {
-			m.contactsArrayMessage = WAProto.Message.ContactsArrayMessage.fromObject(message.contacts)
-		}
-	} else if('location' in message) {
-		m.locationMessage = WAProto.Message.LocationMessage.fromObject(message.location)
-	} else if('react' in message) {
-		if(!message.react.senderTimestampMs) {
-			message.react.senderTimestampMs = Date.now()
-		}
-
-		m.reactionMessage = WAProto.Message.ReactionMessage.fromObject(message.react)
-	} else if('delete' in message) {
-		m.protocolMessage = {
-			key: message.delete,
-			type: WAProto.Message.ProtocolMessage.Type.REVOKE
-		}
-	} else if('forward' in message) {
-		m = generateForwardMessageContent(
-			message.forward,
-			message.force
-		)
-	} else if('disappearingMessagesInChat' in message) {
-		const exp = typeof message.disappearingMessagesInChat === 'boolean' ?
-			(message.disappearingMessagesInChat ? WA_DEFAULT_EPHEMERAL : 0) :
-			message.disappearingMessagesInChat
-		m = prepareDisappearingMessageSettingContent(exp)
-	} else if('buttonReply' in message) {
-		switch (message.type) {
-		case 'template':
-			m.templateButtonReplyMessage = {
-				selectedDisplayText: message.buttonReply.displayText,
-				selectedId: message.buttonReply.id,
-				selectedIndex: message.buttonReply.index,
-			}
-			break
-		case 'plain':
-			m.buttonsResponseMessage = {
-				selectedButtonId: message.buttonReply.id,
-				selectedDisplayText: message.buttonReply.displayText,
-				type: proto.Message.ButtonsResponseMessage.Type.DISPLAY_TEXT,
-			}
-			break
-		}
-	} else if('product' in message) {
-		const { imageMessage } = await prepareWAMessageMedia(
-			{ image: message.product.productImage },
-			options
-		)
-		m.productMessage = WAProto.Message.ProductMessage.fromObject({
-			...message,
-			product: {
-				...message.product,
-				productImage: imageMessage,
-			}
-		})
-	} else if('listReply' in message) {
-		m.listResponseMessage = { ...message.listReply }
-	} else if('poll' in message) {
-		message.poll.selectableCount ||= 0
-
-		if(!Array.isArray(message.poll.values)) {
-			throw new Boom('Invalid poll values', { statusCode: 400 })
-		}
-
-		if(
-			message.poll.selectableCount < 0
-			|| message.poll.selectableCount > message.poll.values.length
-		) {
-			throw new Boom(
-				`poll.selectableCount in poll should be >= 0 and <= ${message.poll.values.length}`,
-				{ statusCode: 400 }
-			)
-		}
-
-		m.messageContextInfo = {
-			// encKey
-			messageSecret: message.poll.messageSecret || randomBytes(32),
-		}
-
-		m.pollCreationMessage = {
-			name: message.poll.name,
-			selectableOptionsCount: message.poll.selectableCount,
-			options: message.poll.values.map(optionName => ({ optionName })),
+			metadata = await musicMetadata.parseStream(rStream, undefined, { duration: true })
+		} finally {
+			rStream.destroy()
 		}
 	} else {
-		m = await prepareWAMessageMedia(
-			message,
-			options
-		)
+		metadata = await musicMetadata.parseStream(buffer, undefined, { duration: true })
 	}
 
-	if('buttons' in message && !!message.buttons) {
-		const buttonsMessage: proto.Message.IButtonsMessage = {
-			buttons: message.buttons!.map(b => ({ ...b, type: proto.Message.ButtonsMessage.Button.Type.RESPONSE }))
-		}
-		if('text' in message) {
-			buttonsMessage.contentText = message.text
-			buttonsMessage.headerType = ButtonType.EMPTY
-		} else {
-			if('caption' in message) {
-				buttonsMessage.contentText = message.caption
-			}
-
-			const type = Object.keys(m)[0].replace('Message', '').toUpperCase()
-			buttonsMessage.headerType = ButtonType[type]
-
-			Object.assign(buttonsMessage, m)
-		}
-
-		if('footer' in message && !!message.footer) {
-			buttonsMessage.footerText = message.footer
-		}
-
-		m = { buttonsMessage }
-	} else if('templateButtons' in message && !!message.templateButtons) {
-		const msg: proto.Message.TemplateMessage.IHydratedFourRowTemplate = {
-			hydratedButtons: message.templateButtons
-		}
-
-		if('text' in message) {
-			msg.hydratedContentText = message.text
-		} else {
-
-			if('caption' in message) {
-				msg.hydratedContentText = message.caption
-			}
-
-			Object.assign(msg, m)
-		}
-
-		if('footer' in message && !!message.footer) {
-			msg.hydratedFooterText = message.footer
-		}
-
-		m = {
-			templateMessage: {
-				fourRowTemplate: msg,
-				hydratedTemplate: msg
-			}
-		}
-	}
-
-	if('sections' in message && !!message.sections) {
-		const listMessage: proto.Message.IListMessage = {
-			sections: message.sections,
-			buttonText: message.buttonText,
-			title: message.title,
-			footerText: message.footer,
-			description: message.text,
-			listType: proto.Message.ListMessage.ListType.SINGLE_SELECT
-		}
-
-		m = { listMessage }
-	}
-
-	if('viewOnce' in message && !!message.viewOnce) {
-		m = { viewOnceMessage: { message: m } }
-	}
-
-	if('mentions' in message && message.mentions?.length) {
-		const [messageType] = Object.keys(m)
-		m[messageType].contextInfo = m[messageType] || { }
-		m[messageType].contextInfo.mentionedJid = message.mentions
-	}
-
-	if('edit' in message) {
-		m = {
-			protocolMessage: {
-				key: message.edit,
-				editedMessage: m,
-				timestampMs: Date.now(),
-				type: WAProto.Message.ProtocolMessage.Type.MESSAGE_EDIT
-			}
-		}
-	}
-
-	if('contextInfo' in message && !!message.contextInfo) {
-		const [messageType] = Object.keys(m)
-		m[messageType] = m[messageType] || {}
-		m[messageType].contextInfo = message.contextInfo
-	}
-
-	return WAProto.Message.fromObject(m)
-}
-
-export const generateWAMessageFromContent = (
-	jid: string,
-	message: WAMessageContent,
-	options: MessageGenerationOptionsFromContent
-) => {
-	// set timestamp to now
-	// if not specified
-	if(!options.timestamp) {
-		options.timestamp = new Date()
-	}
-
-	const key = Object.keys(message)[0]
-	const timestamp = unixTimestampSeconds(options.timestamp)
-	const { quoted, userJid } = options
-
-	if(quoted) {
-		const participant = quoted.key.fromMe ? userJid : (quoted.participant || quoted.key.participant || quoted.key.remoteJid)
-
-		let quotedMsg = normalizeMessageContent(quoted.message)!
-		const msgType = getContentType(quotedMsg)!
-		// strip any redundant properties
-		quotedMsg = proto.Message.fromObject({ [msgType]: quotedMsg[msgType] })
-
-		const quotedContent = quotedMsg[msgType]
-		if(typeof quotedContent === 'object' && quotedContent && 'contextInfo' in quotedContent) {
-			delete quotedContent.contextInfo
-		}
-
-		const contextInfo: proto.IContextInfo = message[key].contextInfo || { }
-		contextInfo.participant = jidNormalizedUser(participant!)
-		contextInfo.stanzaId = quoted.key.id
-		contextInfo.quotedMessage = quotedMsg
-
-		// if a participant is quoted, then it must be a group
-		// hence, remoteJid of group must also be entered
-		if(jid !== quoted.key.remoteJid) {
-			contextInfo.remoteJid = quoted.key.remoteJid
-		}
-
-		message[key].contextInfo = contextInfo
-	}
-
-	if(
-		// if we want to send a disappearing message
-		!!options?.ephemeralExpiration &&
-		// and it's not a protocol message -- delete, toggle disappear message
-		key !== 'protocolMessage' &&
-		// already not converted to disappearing message
-		key !== 'ephemeralMessage'
-	) {
-		message[key].contextInfo = {
-			...(message[key].contextInfo || {}),
-			expiration: options.ephemeralExpiration || WA_DEFAULT_EPHEMERAL,
-			//ephemeralSettingTimestamp: options.ephemeralOptions.eph_setting_ts?.toString()
-		}
-	}
-
-	message = WAProto.Message.fromObject(message)
-
-	const messageJSON = {
-		key: {
-			remoteJid: jid,
-			fromMe: true,
-			id: options?.messageId || generateMessageID(),
-		},
-		message: message,
-		messageTimestamp: timestamp,
-		messageStubParameters: [],
-		participant: isJidGroup(jid) ? userJid : undefined,
-		status: WAMessageStatus.PENDING
-	}
-	return WAProto.WebMessageInfo.fromObject(messageJSON)
-}
-
-export const generateWAMessage = async(
-	jid: string,
-	content: AnyMessageContent,
-	options: MessageGenerationOptions,
-) => {
-	// ensure msg ID is with every log
-	options.logger = options?.logger?.child({ msgId: options.messageId })
-	return generateWAMessageFromContent(
-		jid,
-		await generateWAMessageContent(
-			content,
-			options
-		),
-		options
-	)
-}
-
-/** Get the key to access the true type of content */
-export const getContentType = (content: WAProto.IMessage | undefined) => {
-	if(content) {
-		const keys = Object.keys(content)
-		const key = keys.find(k => (k === 'conversation' || k.endsWith('Message')) && k !== 'senderKeyDistributionMessage')
-		return key as keyof typeof content
-	}
+	return metadata.format.duration
 }
 
 /**
- * Normalizes ephemeral, view once messages to regular message content
- * Eg. image messages in ephemeral messages, in view once messages etc.
- * @param content
- * @returns
+  referenced from and modifying https://github.com/wppconnect-team/wa-js/blob/main/src/chat/functions/prepareAudioWaveform.ts
  */
-export const normalizeMessageContent = (content: WAMessageContent | null | undefined): WAMessageContent | undefined => {
-	 if(!content) {
-		 return undefined
-	 }
-
-	 // set max iterations to prevent an infinite loop
-	 for(let i = 0;i < 5;i++) {
-		 const inner = getFutureProofMessage(content)
-		 if(!inner) {
-			 break
-		 }
-
-		 content = inner.message
-	 }
-
-	 return content!
-
-	 function getFutureProofMessage(message: typeof content) {
-		 return (
-			 message?.ephemeralMessage
-			 || message?.viewOnceMessage
-			 || message?.documentWithCaptionMessage
-			 || message?.viewOnceMessageV2
-			 || message?.editedMessage
-		 )
-	 }
-}
-
-/**
- * Extract the true message content from a message
- * Eg. extracts the inner message from a disappearing message/view once message
- */
-export const extractMessageContent = (content: WAMessageContent | undefined | null): WAMessageContent | undefined => {
-	const extractFromTemplateMessage = (msg: proto.Message.TemplateMessage.IHydratedFourRowTemplate | proto.Message.IButtonsMessage) => {
-		if(msg.imageMessage) {
-			return { imageMessage: msg.imageMessage }
-		} else if(msg.documentMessage) {
-			return { documentMessage: msg.documentMessage }
-		} else if(msg.videoMessage) {
-			return { videoMessage: msg.videoMessage }
-		} else if(msg.locationMessage) {
-			return { locationMessage: msg.locationMessage }
-		} else {
-			return {
-				conversation:
-					'contentText' in msg
-						? msg.contentText
-						: ('hydratedContentText' in msg ? msg.hydratedContentText : '')
-			}
-		}
-	}
-
-	content = normalizeMessageContent(content)
-
-	if(content?.buttonsMessage) {
-	  return extractFromTemplateMessage(content.buttonsMessage!)
-	}
-
-	if(content?.templateMessage?.hydratedFourRowTemplate) {
-		return extractFromTemplateMessage(content?.templateMessage?.hydratedFourRowTemplate)
-	}
-
-	if(content?.templateMessage?.hydratedTemplate) {
-		return extractFromTemplateMessage(content?.templateMessage?.hydratedTemplate)
-	}
-
-	if(content?.templateMessage?.fourRowTemplate) {
-		return extractFromTemplateMessage(content?.templateMessage?.fourRowTemplate)
-	}
-
-	return content
-}
-
-/**
- * Returns the device predicted by message ID
- */
-export const getDevice = (id: string) => {
-	const deviceType = id.length > 21 ? 'android' : id.substring(0, 2) === '3A' ? 'ios' : 'web'
-	return deviceType
-}
-
-/** Upserts a receipt in the message */
-export const updateMessageWithReceipt = (msg: Pick<WAMessage, 'userReceipt'>, receipt: MessageUserReceipt) => {
-	msg.userReceipt = msg.userReceipt || []
-	const recp = msg.userReceipt.find(m => m.userJid === receipt.userJid)
-	if(recp) {
-		Object.assign(recp, receipt)
-	} else {
-		msg.userReceipt.push(receipt)
-	}
-}
-
-/** Update the message with a new reaction */
-export const updateMessageWithReaction = (msg: Pick<WAMessage, 'reactions'>, reaction: proto.IReaction) => {
-	const authorID = getKeyAuthor(reaction.key)
-
-	const reactions = (msg.reactions || [])
-		.filter(r => getKeyAuthor(r.key) !== authorID)
-	if(reaction.text) {
-		reactions.push(reaction)
-	}
-
-	msg.reactions = reactions
-}
-
-/** Update the message with a new poll update */
-export const updateMessageWithPollUpdate = (
-	msg: Pick<WAMessage, 'pollUpdates'>,
-	update: proto.IPollUpdate
-) => {
-	const authorID = getKeyAuthor(update.pollUpdateMessageKey)
-
-	const reactions = (msg.pollUpdates || [])
-		.filter(r => getKeyAuthor(r.pollUpdateMessageKey) !== authorID)
-	if(update.vote?.selectedOptions?.length) {
-		reactions.push(update)
-	}
-
-	msg.pollUpdates = reactions
-}
-
-type VoteAggregation = {
-	name: string
-	voters: string[]
-}
-
-/**
- * Aggregates all poll updates in a poll.
- * @param msg the poll creation message
- * @param meId your jid
- * @returns A list of options & their voters
- */
-export function getAggregateVotesInPollMessage(
-	{ message, pollUpdates }: Pick<WAMessage, 'pollUpdates' | 'message'>,
-	meId?: string
-) {
-	const opts = message?.pollCreationMessage?.options || message?.pollCreationMessageV2?.options || message?.pollCreationMessageV3?.options || []
-	const voteHashMap = opts.reduce((acc, opt) => {
-		const hash = sha256(Buffer.from(opt.optionName || '')).toString()
-		acc[hash] = {
-			name: opt.optionName || '',
-			voters: []
-		}
-		return acc
-	}, {} as { [_: string]: VoteAggregation })
-
-	for(const update of pollUpdates || []) {
-		const { vote } = update
-		if(!vote) {
-			continue
-		}
-
-		for(const option of vote.selectedOptions || []) {
-			const hash = option.toString()
-			let data = voteHashMap[hash]
-			if(!data) {
-				voteHashMap[hash] = {
-					name: 'Unknown',
-					voters: []
-				}
-				data = voteHashMap[hash]
-			}
-
-			voteHashMap[hash].voters.push(
-				getKeyAuthor(update.pollUpdateMessageKey, meId)
-			)
-		}
-	}
-
-	return Object.values(voteHashMap)
-}
-
-/** Given a list of message keys, aggregates them by chat & sender. Useful for sending read receipts in bulk */
-export const aggregateMessageKeysNotFromMe = (keys: proto.IMessageKey[]) => {
-	const keyMap: { [id: string]: { jid: string, participant: string | undefined, messageIds: string[] } } = { }
-	for(const { remoteJid, id, participant, fromMe } of keys) {
-		if(!fromMe) {
-			const uqKey = `${remoteJid}:${participant || ''}`
-			if(!keyMap[uqKey]) {
-				keyMap[uqKey] = {
-					jid: remoteJid!,
-					participant: participant!,
-					messageIds: []
-				}
-			}
-
-			keyMap[uqKey].messageIds.push(id!)
-		}
-	}
-
-	return Object.values(keyMap)
-}
-
-type DownloadMediaMessageContext = {
-	reuploadRequest: (msg: WAMessage) => Promise<WAMessage>
-	logger: Logger
-}
-
-const REUPLOAD_REQUIRED_STATUS = [410, 404]
-
-/**
- * Downloads the given message. Throws an error if it's not a media message
- */
-export const downloadMediaMessage = async(
-	message: WAMessage,
-	type: 'buffer' | 'stream',
-	options: MediaDownloadOptions,
-	ctx?: DownloadMediaMessageContext
-) => {
+export async function getAudioWaveform(buffer: Buffer | string | Readable, logger?: Logger) {
 	try {
-		const result = await downloadMsg()
-		return result
-	} catch(error) {
-		if(ctx) {
-			if(axios.isAxiosError(error)) {
-				// check if the message requires a reupload
-				if(REUPLOAD_REQUIRED_STATUS.includes(error.response?.status!)) {
-					ctx.logger.info({ key: message.key }, 'sending reupload media request...')
-					// request reupload
-					message = await ctx.reuploadRequest(message)
-					const result = await downloadMsg()
-					return result
+		const audioDecode = (buffer: Buffer | ArrayBuffer | Uint8Array) => import('audio-decode').then(({ default: audioDecode }) => audioDecode(buffer))
+		let audioData: Buffer
+		if(Buffer.isBuffer(buffer)) {
+			audioData = buffer
+		} else if(typeof buffer === 'string') {
+			const rStream = createReadStream(buffer)
+			audioData = await toBuffer(rStream)
+		} else {
+			audioData = await toBuffer(buffer)
+		}
+
+		const audioBuffer = await audioDecode(audioData)
+
+		const rawData = audioBuffer.getChannelData(0) // We only need to work with one channel of data
+		const samples = 64 // Number of samples we want to have in our final data set
+		const blockSize = Math.floor(rawData.length / samples) // the number of samples in each subdivision
+		const filteredData: number[] = []
+		for(let i = 0; i < samples; i++) {
+		  	const blockStart = blockSize * i // the location of the first sample in the block
+		  	let sum = 0
+		  	for(let j = 0; j < blockSize; j++) {
+				sum = sum + Math.abs(rawData[blockStart + j]) // find the sum of all the samples in the block
+			}
+
+			filteredData.push(sum / blockSize) // divide the sum by the block size to get the average
+		}
+
+		// This guarantees that the largest data point will be set to 1, and the rest of the data will scale proportionally.
+		const multiplier = Math.pow(Math.max(...filteredData), -1)
+		const normalizedData = filteredData.map((n) => n * multiplier)
+
+		// Generate waveform like WhatsApp
+		const waveform = new Uint8Array(
+			normalizedData.map((n) => Math.floor(100 * n))
+		)
+
+		return waveform
+	} catch(e) {
+		logger?.debug('Failed to generate waveform: ' + e)
+	}
+}
+
+
+export const toReadable = (buffer: Buffer) => {
+	const readable = new Readable({ read: () => {} })
+	readable.push(buffer)
+	readable.push(null)
+	return readable
+}
+
+export const toBuffer = async(stream: Readable) => {
+	const chunks: Buffer[] = []
+	for await (const chunk of stream) {
+		chunks.push(chunk)
+	}
+
+	stream.destroy()
+	return Buffer.concat(chunks)
+}
+
+export const getStream = async(item: WAMediaUpload, opts?: AxiosRequestConfig) => {
+	if(Buffer.isBuffer(item)) {
+		return { stream: toReadable(item), type: 'buffer' } as const
+	}
+
+	if('stream' in item) {
+		return { stream: item.stream, type: 'readable' } as const
+	}
+
+	if(item.url.toString().startsWith('http://') || item.url.toString().startsWith('https://')) {
+		return { stream: await getHttpStream(item.url, opts), type: 'remote' } as const
+	}
+
+	return { stream: createReadStream(item.url), type: 'file' } as const
+}
+
+/** generates a thumbnail for a given media, if required */
+export async function generateThumbnail(
+	file: string,
+	mediaType: 'video' | 'image',
+	options: {
+        logger?: Logger
+    }
+) {
+	let thumbnail: string | undefined
+	let originalImageDimensions: { width: number, height: number } | undefined
+	if(mediaType === 'image') {
+		const { buffer, original } = await extractImageThumb(file)
+		thumbnail = buffer.toString('base64')
+		if(original.width && original.height) {
+			originalImageDimensions = {
+				width: original.width,
+				height: original.height,
+			}
+		}
+	} else if(mediaType === 'video') {
+		const imgFilename = join(getTmpFilesDirectory(), generateMessageID() + '.jpg')
+		try {
+			await extractVideoThumb(file, imgFilename, '00:00:00', { width: 32, height: 32 })
+			const buff = await fs.readFile(imgFilename)
+			thumbnail = buff.toString('base64')
+
+			await fs.unlink(imgFilename)
+		} catch(err) {
+			options.logger?.debug('could not generate video thumb: ' + err)
+		}
+	}
+
+	return {
+		thumbnail,
+		originalImageDimensions
+	}
+}
+
+export const getHttpStream = async(url: string | URL, options: AxiosRequestConfig & { isStream?: true } = {}) => {
+	const { default: axios } = await import('axios')
+	const fetched = await axios.get(url.toString(), { ...options, responseType: 'stream' })
+	return fetched.data as Readable
+}
+
+type EncryptedStreamOptions = {
+	saveOriginalFileIfRequired?: boolean
+	logger?: Logger
+	opts?: AxiosRequestConfig
+}
+
+export const encryptedStream = async(
+	media: WAMediaUpload,
+	mediaType: MediaType,
+	{ logger, saveOriginalFileIfRequired, opts }: EncryptedStreamOptions = {}
+) => {
+	const { stream, type } = await getStream(media, opts)
+
+	logger?.debug('fetched media stream')
+
+	const mediaKey = Crypto.randomBytes(32)
+	const { cipherKey, iv, macKey } = getMediaKeys(mediaKey, mediaType)
+	const encWriteStream = new Readable({ read: () => {} })
+
+	let bodyPath: string | undefined
+	let writeStream: WriteStream | undefined
+	let didSaveToTmpPath = false
+	if(type === 'file') {
+		bodyPath = (media as any).url
+	} else if(saveOriginalFileIfRequired) {
+		bodyPath = join(getTmpFilesDirectory(), mediaType + generateMessageID())
+		writeStream = createWriteStream(bodyPath)
+		didSaveToTmpPath = true
+	}
+
+	let fileLength = 0
+	const aes = Crypto.createCipheriv('aes-256-cbc', cipherKey, iv)
+	let hmac = Crypto.createHmac('sha256', macKey!).update(iv)
+	let sha256Plain = Crypto.createHash('sha256')
+	let sha256Enc = Crypto.createHash('sha256')
+
+	try {
+		for await (const data of stream) {
+			fileLength += data.length
+
+			if(
+				type === 'remote'
+				&& opts?.maxContentLength
+				&& fileLength + data.length > opts.maxContentLength
+			) {
+				throw new Boom(
+					`content length exceeded when encrypting "${type}"`,
+					{
+						data: { media, type }
+					}
+				)
+			}
+
+			sha256Plain = sha256Plain.update(data)
+			if(writeStream) {
+				if(!writeStream.write(data)) {
+					await once(writeStream, 'drain')
 				}
+			}
+
+			onChunk(aes.update(data))
+		}
+
+		onChunk(aes.final())
+
+		const mac = hmac.digest().slice(0, 10)
+		sha256Enc = sha256Enc.update(mac)
+
+		const fileSha256 = sha256Plain.digest()
+		const fileEncSha256 = sha256Enc.digest()
+
+		encWriteStream.push(mac)
+		encWriteStream.push(null)
+
+		writeStream?.end()
+		stream.destroy()
+
+		logger?.debug('encrypted data successfully')
+
+		return {
+			mediaKey,
+			encWriteStream,
+			bodyPath,
+			mac,
+			fileEncSha256,
+			fileSha256,
+			fileLength,
+			didSaveToTmpPath
+		}
+	} catch(error) {
+		// destroy all streams with error
+		encWriteStream.destroy()
+		writeStream?.destroy()
+		aes.destroy()
+		hmac.destroy()
+		sha256Plain.destroy()
+		sha256Enc.destroy()
+		stream.destroy()
+
+		if(didSaveToTmpPath) {
+			try {
+				await fs.unlink(bodyPath!)
+			} catch(err) {
+				logger?.error({ err }, 'failed to save to tmp path')
 			}
 		}
 
 		throw error
 	}
 
-	async function downloadMsg() {
-		const mContent = extractMessageContent(message.message)
-		if(!mContent) {
-			throw new Boom('No message present', { statusCode: 400, data: message })
-		}
-
-		const contentType = getContentType(mContent)
-		let mediaType = contentType?.replace('Message', '') as MediaType
-		const media = mContent[contentType!]
-
-		if(!media || typeof media !== 'object' || (!('url' in media) && !('thumbnailDirectPath' in media))) {
-			throw new Boom(`"${contentType}" message is not a media message`)
-		}
-
-		let download: DownloadableMessage
-		if('thumbnailDirectPath' in media && !('url' in media)) {
-			download = {
-				directPath: media.thumbnailDirectPath,
-				mediaKey: media.mediaKey
-			}
-			mediaType = 'thumbnail-link'
-		} else {
-			download = media
-		}
-
-		const stream = await downloadContentFromMessage(download, mediaType, options)
-		if(type === 'buffer') {
-			const bufferArray: Buffer[] = []
-			for await (const chunk of stream) {
-				bufferArray.push(chunk)
-			}
-
-			return Buffer.concat(bufferArray)
-		}
-
-		return stream
+	function onChunk(buff: Buffer) {
+		sha256Enc = sha256Enc.update(buff)
+		hmac = hmac.update(buff)
+		encWriteStream.push(buff)
 	}
 }
 
-/** Checks whether the given message is a media message; if it is returns the inner content */
-export const assertMediaContent = (content: proto.IMessage | null | undefined) => {
-	content = extractMessageContent(content)
-	const mediaContent = content?.documentMessage
-		|| content?.imageMessage
-		|| content?.videoMessage
-		|| content?.audioMessage
-		|| content?.stickerMessage
-	if(!mediaContent) {
-		throw new Boom(
-			'given message is not a media message',
-			{ statusCode: 400, data: content }
-		)
+const DEF_HOST = 'mmg.whatsapp.net'
+const AES_CHUNK_SIZE = 16
+
+const toSmallestChunkSize = (num: number) => {
+	return Math.floor(num / AES_CHUNK_SIZE) * AES_CHUNK_SIZE
+}
+
+export type MediaDownloadOptions = {
+    startByte?: number
+    endByte?: number
+	options?: AxiosRequestConfig<any>
+}
+
+export const getUrlFromDirectPath = (directPath: string) => `https://${DEF_HOST}${directPath}`
+
+export const downloadContentFromMessage = (
+	{ mediaKey, directPath, url }: DownloadableMessage,
+	type: MediaType,
+	opts: MediaDownloadOptions = { }
+) => {
+	const downloadUrl = url || getUrlFromDirectPath(directPath!)
+	const keys = getMediaKeys(mediaKey, type)
+
+	return downloadEncryptedContent(downloadUrl, keys, opts)
+}
+
+/**
+ * Decrypts and downloads an AES256-CBC encrypted file given the keys.
+ * Assumes the SHA256 of the plaintext is appended to the end of the ciphertext
+ * */
+export const downloadEncryptedContent = async(
+	downloadUrl: string,
+	{ cipherKey, iv }: MediaDecryptionKeyInfo,
+	{ startByte, endByte, options }: MediaDownloadOptions = { }
+) => {
+	let bytesFetched = 0
+	let startChunk = 0
+	let firstBlockIsIV = false
+	// if a start byte is specified -- then we need to fetch the previous chunk as that will form the IV
+	if(startByte) {
+		const chunk = toSmallestChunkSize(startByte || 0)
+		if(chunk) {
+			startChunk = chunk - AES_CHUNK_SIZE
+			bytesFetched = chunk
+
+			firstBlockIsIV = true
+		}
 	}
 
-	return mediaContent
+	const endChunk = endByte ? toSmallestChunkSize(endByte || 0) + AES_CHUNK_SIZE : undefined
+
+	const headers: AxiosRequestConfig['headers'] = {
+		...options?.headers || { },
+		Origin: DEFAULT_ORIGIN,
+	}
+	if(startChunk || endChunk) {
+		headers!.Range = `bytes=${startChunk}-`
+		if(endChunk) {
+			headers!.Range += endChunk
+		}
+	}
+
+	// download the message
+	const fetched = await getHttpStream(
+		downloadUrl,
+		{
+			...options || { },
+			headers,
+			maxBodyLength: Infinity,
+			maxContentLength: Infinity,
+		}
+	)
+
+	let remainingBytes = Buffer.from([])
+
+	let aes: Crypto.Decipher
+
+	const pushBytes = (bytes: Buffer, push: (bytes: Buffer) => void) => {
+		if(startByte || endByte) {
+			const start = bytesFetched >= startByte! ? undefined : Math.max(startByte! - bytesFetched, 0)
+			const end = bytesFetched + bytes.length < endByte! ? undefined : Math.max(endByte! - bytesFetched, 0)
+
+			push(bytes.slice(start, end))
+
+			bytesFetched += bytes.length
+		} else {
+			push(bytes)
+		}
+	}
+
+	const output = new Transform({
+		transform(chunk, _, callback) {
+			let data = Buffer.concat([remainingBytes, chunk])
+
+			const decryptLength = toSmallestChunkSize(data.length)
+			remainingBytes = data.slice(decryptLength)
+			data = data.slice(0, decryptLength)
+
+			if(!aes) {
+				let ivValue = iv
+				if(firstBlockIsIV) {
+					ivValue = data.slice(0, AES_CHUNK_SIZE)
+					data = data.slice(AES_CHUNK_SIZE)
+				}
+
+				aes = Crypto.createDecipheriv('aes-256-cbc', cipherKey, ivValue)
+				// if an end byte that is not EOF is specified
+				// stop auto padding (PKCS7) -- otherwise throws an error for decryption
+				if(endByte) {
+					aes.setAutoPadding(false)
+				}
+
+			}
+
+			try {
+				pushBytes(aes.update(data), b => this.push(b))
+				callback()
+			} catch(error) {
+				callback(error)
+			}
+		},
+		final(callback) {
+			try {
+				pushBytes(aes.final(), b => this.push(b))
+				callback()
+			} catch(error) {
+				callback(error)
+			}
+		},
+	})
+	return fetched.pipe(output, { end: true })
+}
+
+export function extensionForMediaMessage(message: WAMessageContent) {
+	const getExtension = (mimetype: string) => mimetype.split(';')[0].split('/')[1]
+	const type = Object.keys(message)[0] as MessageType
+	let extension: string
+	if(
+		type === 'locationMessage' ||
+		type === 'liveLocationMessage' ||
+		type === 'productMessage'
+	) {
+		extension = '.jpeg'
+	} else {
+		const messageContent = message[type] as WAGenericMediaMessage
+		extension = getExtension(messageContent.mimetype!)
+	}
+
+	return extension
+}
+
+export const getWAUploadToServer = (
+	{ customUploadHosts, fetchAgent, logger, options }: SocketConfig,
+	refreshMediaConn: (force: boolean) => Promise<MediaConnInfo>,
+): WAMediaUploadFunction => {
+	return async(stream, { mediaType, fileEncSha256B64, timeoutMs }) => {
+		const { default: axios } = await import('axios')
+		// send a query JSON to obtain the url & auth token to upload our media
+		let uploadInfo = await refreshMediaConn(false)
+
+		let urls: { mediaUrl: string, directPath: string } | undefined
+		const hosts = [ ...customUploadHosts, ...uploadInfo.hosts ]
+
+		const chunks: Buffer[] = []
+		for await (const chunk of stream) {
+			chunks.push(chunk)
+		}
+
+		const reqBody = Buffer.concat(chunks)
+		fileEncSha256B64 = encodeBase64EncodedStringForUpload(fileEncSha256B64)
+
+		for(const { hostname, maxContentLengthBytes } of hosts) {
+			logger.debug(`uploading to "${hostname}"`)
+
+			const auth = encodeURIComponent(uploadInfo.auth) // the auth token
+			const url = `https://${hostname}${MEDIA_PATH_MAP[mediaType]}/${fileEncSha256B64}?auth=${auth}&token=${fileEncSha256B64}`
+			let result: any
+			try {
+				if(maxContentLengthBytes && reqBody.length > maxContentLengthBytes) {
+					throw new Boom(`Body too large for "${hostname}"`, { statusCode: 413 })
+				}
+
+				const body = await axios.post(
+					url,
+					reqBody,
+					{
+						...options,
+						headers: {
+							...options.headers || { },
+							'Content-Type': 'application/octet-stream',
+							'Origin': DEFAULT_ORIGIN
+						},
+						httpsAgent: fetchAgent,
+						timeout: timeoutMs,
+						responseType: 'json',
+						maxBodyLength: Infinity,
+						maxContentLength: Infinity,
+					}
+				)
+				result = body.data
+
+				if(result?.url || result?.directPath) {
+					urls = {
+						mediaUrl: result.url,
+						directPath: result.direct_path
+					}
+					break
+				} else {
+					uploadInfo = await refreshMediaConn(true)
+					throw new Error(`upload failed, reason: ${JSON.stringify(result)}`)
+				}
+			} catch(error) {
+				if(axios.isAxiosError(error)) {
+					result = error.response?.data
+				}
+
+				const isLast = hostname === hosts[uploadInfo.hosts.length - 1]?.hostname
+				logger.warn({ trace: error.stack, uploadResult: result }, `Error in uploading to ${hostname} ${isLast ? '' : ', retrying...'}`)
+			}
+		}
+
+		if(!urls) {
+			throw new Boom(
+				'Media upload failed on all hosts',
+				{ statusCode: 500 }
+			)
+		}
+
+		return urls
+	}
+}
+
+const getMediaRetryKey = (mediaKey: Buffer | Uint8Array) => {
+	return hkdf(mediaKey, 32, { info: 'WhatsApp Media Retry Notification' })
+}
+
+/**
+ * Generate a binary node that will request the phone to re-upload the media & return the newly uploaded URL
+ */
+export const encryptMediaRetryRequest = (
+	key: proto.IMessageKey,
+	mediaKey: Buffer | Uint8Array,
+	meId: string
+) => {
+	const recp: proto.IServerErrorReceipt = { stanzaId: key.id }
+	const recpBuffer = proto.ServerErrorReceipt.encode(recp).finish()
+
+	const iv = Crypto.randomBytes(12)
+	const retryKey = getMediaRetryKey(mediaKey)
+	const ciphertext = aesEncryptGCM(recpBuffer, retryKey, iv, Buffer.from(key.id!))
+
+	const req: BinaryNode = {
+		tag: 'receipt',
+		attrs: {
+			id: key.id!,
+			to: jidNormalizedUser(meId),
+			type: 'server-error'
+		},
+		content: [
+			// this encrypt node is actually pretty useless
+			// the media is returned even without this node
+			// keeping it here to maintain parity with WA Web
+			{
+				tag: 'encrypt',
+				attrs: { },
+				content: [
+					{ tag: 'enc_p', attrs: { }, content: ciphertext },
+					{ tag: 'enc_iv', attrs: { }, content: iv }
+				]
+			},
+			{
+				tag: 'rmr',
+				attrs: {
+					jid: key.remoteJid!,
+					'from_me': (!!key.fromMe).toString(),
+					// @ts-ignore
+					participant: key.participant || undefined
+				}
+			}
+		]
+	}
+
+	return req
+}
+
+export const decodeMediaRetryNode = (node: BinaryNode) => {
+	const rmrNode = getBinaryNodeChild(node, 'rmr')!
+
+	const event: BaileysEventMap['messages.media-update'][number] = {
+		key: {
+			id: node.attrs.id,
+			remoteJid: rmrNode.attrs.jid,
+			fromMe: rmrNode.attrs.from_me === 'true',
+			participant: rmrNode.attrs.participant
+		}
+	}
+
+	const errorNode = getBinaryNodeChild(node, 'error')
+	if(errorNode) {
+		const errorCode = +errorNode.attrs.code
+		event.error = new Boom(
+			`Failed to re-upload media (${errorCode})`,
+			{ data: errorNode.attrs, statusCode: getStatusCodeForMediaRetry(errorCode) }
+		)
+	} else {
+		const encryptedInfoNode = getBinaryNodeChild(node, 'encrypt')
+		const ciphertext = getBinaryNodeChildBuffer(encryptedInfoNode, 'enc_p')
+		const iv = getBinaryNodeChildBuffer(encryptedInfoNode, 'enc_iv')
+		if(ciphertext && iv) {
+			event.media = { ciphertext, iv }
+		} else {
+			event.error = new Boom('Failed to re-upload media (missing ciphertext)', { statusCode: 404 })
+		}
+	}
+
+	return event
+}
+
+export const decryptMediaRetryData = (
+	{ ciphertext, iv }: { ciphertext: Uint8Array, iv: Uint8Array },
+	mediaKey: Uint8Array,
+	msgId: string
+) => {
+	const retryKey = getMediaRetryKey(mediaKey)
+	const plaintext = aesDecryptGCM(ciphertext, retryKey, iv, Buffer.from(msgId))
+	return proto.MediaRetryNotification.decode(plaintext)
+}
+
+export const getStatusCodeForMediaRetry = (code: number) => MEDIA_RETRY_STATUS_MAP[code]
+
+const MEDIA_RETRY_STATUS_MAP = {
+	[proto.MediaRetryNotification.ResultType.SUCCESS]: 200,
+	[proto.MediaRetryNotification.ResultType.DECRYPTION_ERROR]: 412,
+	[proto.MediaRetryNotification.ResultType.NOT_FOUND]: 404,
+	[proto.MediaRetryNotification.ResultType.GENERAL_ERROR]: 418,
+} as const
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function __importStar(arg0: any): any {
+	throw new Error('Function not implemented.')
 }
